@@ -1,0 +1,31 @@
+# 가상환경
+.venv/
+venv/
+env/
+
+# 실행된 노트북 (출력 포함)
+algae_prediction_model_executed.ipynb
+
+# 모델 아티팩트 (용량 큰 바이너리)
+*.pkl
+
+# # 생성된 이미지/결과 파일
+# *.png
+# test_predictions.csv
+
+# Python 캐시
+__pycache__/
+*.py[cod]
+*.pyo
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# 환경 변수
+.env
