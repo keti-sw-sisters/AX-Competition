@@ -620,7 +620,7 @@ AX 데이터/
 ├── dashboard_app.py            ← [6단계] Streamlit 실시간 대시보드
 │                                  실행: streamlit run dashboard_app.py
 │
-├── data_preprocessing.ipynb   ← 원본 데이터 전처리 과정
+├── Code_File.ipynb            ← 원본 데이터 전처리 과정 (구 data_preprocessing.ipynb)
 ├── algae_model_t7.pkl          ← 최종 예측 모델 (algae_analysis 실행 후 생성)
 ├── dashboard_mockup.png        ← 대시보드 화면 목업 이미지
 └── README.md                   ← 이 문서
@@ -629,7 +629,7 @@ AX 데이터/
 ### 실행 순서
 
 ```
-1. data_preprocessing.ipynb  (선택 — 전처리 과정 확인)
+1. Code_File.ipynb  (선택 — 전처리 과정 확인)
         ↓
 2. data_eda.ipynb             (EDA + 기초 모델링)
         ↓
