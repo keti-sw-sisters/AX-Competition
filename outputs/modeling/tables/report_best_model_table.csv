@@ -1,0 +1,5 @@
+﻿lead_time,best_model,accuracy,precision,recall,f1,roc_auc,pr_auc,balanced_accuracy,threshold
+T+1,RandomForest,0.9877,0.9701,0.9913,0.9806,0.9994,0.9988,0.9886,0.36
+T+3,XGBoost,0.9771,0.9804,0.9461,0.963,0.9987,0.9971,0.9687,0.63
+T+7,XGBoost,0.9673,0.9516,0.9447,0.9481,0.9958,0.9906,0.9612,0.25
+T+10,XGBoost,0.963,0.9564,0.9258,0.9408,0.995,0.9882,0.9531,0.42

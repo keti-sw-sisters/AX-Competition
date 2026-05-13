@@ -1,0 +1,9 @@
+﻿species,lead_time,n_test,log_rmse,alert_P,alert_R,alert_F1
+microcystis,T+7,2172,1.5545,0.974,0.853,0.91
+microcystis,T+10,2163,1.8091,0.978,0.745,0.846
+anabaena,T+7,2172,1.6295,0.0,0.0,0.0
+anabaena,T+10,2163,1.7891,0.0,0.0,0.0
+oscillatoria,T+7,2172,1.4631,0.0,0.0,0.0
+oscillatoria,T+10,2163,1.5957,0.0,0.0,0.0
+aphanizomenon,T+7,2172,1.6793,0.0,0.0,0.0
+aphanizomenon,T+10,2163,1.9636,0.0,0.0,0.0

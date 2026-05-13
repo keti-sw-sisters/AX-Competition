@@ -1,0 +1,17 @@
+﻿lead_time,model_name,actual,predicted,count
+T+1,RandomForest,non_alert,non_alert,1482
+T+1,RandomForest,non_alert,alert,21
+T+1,RandomForest,alert,non_alert,6
+T+1,RandomForest,alert,alert,681
+T+3,XGBoost,non_alert,non_alert,1484
+T+3,XGBoost,non_alert,alert,13
+T+3,XGBoost,alert,non_alert,37
+T+3,XGBoost,alert,alert,650
+T+7,XGBoost,non_alert,non_alert,1452
+T+7,XGBoost,non_alert,alert,33
+T+7,XGBoost,alert,non_alert,38
+T+7,XGBoost,alert,alert,649
+T+10,XGBoost,non_alert,non_alert,1447
+T+10,XGBoost,non_alert,alert,29
+T+10,XGBoost,alert,non_alert,51
+T+10,XGBoost,alert,alert,636
