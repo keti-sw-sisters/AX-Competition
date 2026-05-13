@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import warnings
 from pathlib import Path
 
 import joblib
@@ -15,6 +16,8 @@ from api_clients import (
     fetch_kma_asos_daily,
     merge_weather_into_observations,
 )
+from environmental_features import add_environmental_features
+from whatif_tab import render_audit_tab, render_report_tab, render_whatif_tab
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -138,6 +141,11 @@ def ensure_operational_data() -> None:
         base_df.to_csv(OPERATIONAL_DATA_PATH, index=False, encoding="utf-8-sig")
 
 
+@st.cache_data(show_spinner=False)
+def load_final_dataframe() -> pd.DataFrame:
+    return _read_csv_any(DATA_PATH)
+
+
 def load_operational_data() -> pd.DataFrame:
     ensure_operational_data()
     return _read_csv_any(OPERATIONAL_DATA_PATH)
@@ -203,52 +211,10 @@ def normalize_data(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def add_group_features(grp: pd.DataFrame) -> pd.DataFrame:
+def add_monitoring_cyano_features(grp: pd.DataFrame) -> pd.DataFrame:
+    """조류·클로로필 lag/rolling 및 보조모델용 BGI(=BGI_env와 동일 수식)."""
     grp = grp.sort_values("조사일").copy()
-    rain_col = "강우량(mm)" if "강우량(mm)" in grp.columns else "일강수량(mm)"
-    temp_col = "수온(℃)"
-    solar_col = "합계 일사량(MJ/m2)"
-    inflow_col = "유입량(㎥/s)"
-    outflow_col = "총방류량(㎥/s)"
-    volume_col = "저수량(백만㎥)"
     chla_col = "Chl-a (㎎/㎥)"
-
-    if temp_col in grp.columns:
-        hot = (grp[temp_col] > 25).fillna(False)
-        runs, count = [], 0
-        for is_hot in hot:
-            count = count + 1 if is_hot else 0
-            runs.append(count)
-        grp["CHD"] = runs
-        grp["water_temp_mean_3d"] = grp[temp_col].rolling(3, min_periods=1).mean()
-        grp["water_temp_mean_7d"] = grp[temp_col].rolling(7, min_periods=1).mean()
-        for lag in [1, 3, 7]:
-            grp[f"water_temp_lag{lag}"] = grp[temp_col].shift(lag)
-
-    if rain_col in grp.columns:
-        grp["rain_sum_3d"] = grp[rain_col].rolling(3, min_periods=1).sum()
-        grp["rain_sum_7d"] = grp[rain_col].rolling(7, min_periods=1).sum()
-        grp["rain_sum_14d"] = grp[rain_col].rolling(14, min_periods=1).sum()
-        dry_runs, count = [], 0
-        for rain in grp[rain_col].fillna(0):
-            count = count + 1 if rain <= 1 else 0
-            dry_runs.append(count)
-        grp["dry_days"] = dry_runs
-        grp["rain_pulse_flag"] = ((grp["dry_days"].shift(1) >= 5) & (grp[rain_col] >= 10)).astype(int)
-
-    if solar_col in grp.columns:
-        grp["solar_mean_3d"] = grp[solar_col].rolling(3, min_periods=1).mean()
-        grp["solar_mean_7d"] = grp[solar_col].rolling(7, min_periods=1).mean()
-
-    if inflow_col in grp.columns and volume_col in grp.columns:
-        safe_inflow = grp[inflow_col].replace(0, np.nan)
-        grp["HRT"] = grp[volume_col] * 1e6 / (safe_inflow * 86400)
-        grp["HRT_7d"] = grp["HRT"].rolling(7, min_periods=1).mean()
-
-    if outflow_col in grp.columns and inflow_col in grp.columns:
-        grp["flow_balance"] = grp[inflow_col] - grp[outflow_col]
-        grp["flow_balance_7d"] = grp["flow_balance"].rolling(7, min_periods=1).mean()
-
     for lag in [1, 3, 7, 10, 14, 30]:
         grp[f"log_cyano_lag{lag}"] = grp["log_cyano"].shift(lag)
         if chla_col in grp.columns:
@@ -263,7 +229,9 @@ def add_group_features(grp: pd.DataFrame) -> pd.DataFrame:
         grp["chla_roll7"] = grp[chla_col].shift(1).rolling(7, min_periods=1).mean()
         grp["chla_roll14"] = grp[chla_col].shift(1).rolling(14, min_periods=1).mean()
 
-    if {"CHD", "solar_mean_7d", "HRT_7d"}.issubset(grp.columns):
+    if "BGI_env" in grp.columns:
+        grp["BGI"] = grp["BGI_env"]
+    elif {"CHD", "solar_mean_7d", "HRT_7d"}.issubset(grp.columns):
         grp["BGI"] = grp["CHD"] * grp["solar_mean_7d"] / grp["HRT_7d"].replace(0, np.nan)
 
     return grp
@@ -272,7 +240,10 @@ def add_group_features(grp: pd.DataFrame) -> pd.DataFrame:
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     model_df = normalize_data(df)
     model_df = pd.concat(
-        [add_group_features(grp) for _, grp in model_df.groupby("채수위치", sort=False)],
+        [
+            add_monitoring_cyano_features(add_environmental_features(grp))
+            for _, grp in model_df.groupby("채수위치", sort=False)
+        ],
         ignore_index=True,
     ).sort_values(["채수위치", "조사일"]).reset_index(drop=True)
 
@@ -326,7 +297,14 @@ def make_prediction_table(
         for col in feature_cols:
             if col not in latest.columns:
                 latest[col] = np.nan
-        proba = bundle["pipeline"].predict_proba(latest[feature_cols])[:, 1]
+        X = latest[feature_cols].copy()
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Skipping features without any observed values.*",
+                category=UserWarning,
+            )
+            proba = bundle["pipeline"].predict_proba(X)[:, 1]
         threshold = float(bundle["threshold"])
         for idx, prob in zip(latest.index, proba):
             row = latest.loc[idx]
@@ -402,6 +380,7 @@ with st.sidebar:
         options=list(MODEL_CONFIGS.keys()),
         index=0,
         help="조류 세포수 측정값이 아직 없으면 환경·수문 기반 모델을, 조류 모니터링 값이 확보되었으면 보조 모델을 사용할 수 있습니다.",
+        key="sidebar_model_mode",
     )
     st.caption(MODEL_CONFIGS[model_mode]["description"])
 
@@ -418,8 +397,8 @@ with st.sidebar:
     if uploaded is not None:
         new_observations = _read_csv_any(uploaded)
         st.write("업로드 미리보기")
-        st.dataframe(new_observations.head(10), use_container_width=True, hide_index=True)
-        if st.button("운영 데이터셋에 추가/갱신", type="secondary", use_container_width=True):
+        st.dataframe(new_observations.head(10), width="stretch", hide_index=True)
+        if st.button("운영 데이터셋에 추가/갱신", type="secondary", width="stretch"):
             try:
                 updated_df, touched_rows, net_added = append_observations(raw_df, new_observations)
                 save_operational_data(updated_df)
@@ -440,7 +419,7 @@ with st.sidebar:
     selected_date = st.date_input("예측 기준일", value=TODAY.date(), min_value=min_date, max_value=date_upper_bound)
     all_sites = sorted(feature_df["채수위치"].dropna().unique().tolist())
     selected_sites = st.multiselect("지점", options=all_sites, default=all_sites)
-    run_clicked = st.button("예측 실행", type="primary", use_container_width=True)
+    run_clicked = st.button("예측 실행", type="primary", width="stretch")
 
     st.divider()
     st.caption(f"운영 데이터: `{OPERATIONAL_DATA_PATH.name}`")
@@ -454,7 +433,7 @@ with st.sidebar:
         data=operational_csv,
         file_name="operational_data.csv",
         mime="text/csv",
-        use_container_width=True,
+        width="stretch",
     )
 
 best_summary, model_results, shap_top_features, scenario_recommendation = load_tables(model_mode)
@@ -476,8 +455,18 @@ summary_by_lead = (
     .first()
 )
 
-tab_dashboard, tab_predict, tab_api, tab_reason, tab_action, tab_performance = st.tabs(
-    ["대시보드", "예측 실행", "API 수집", "위험 원인", "대응 시나리오", "모델 성능"]
+tab_dashboard, tab_whatif, tab_audit, tab_report, tab_predict, tab_api, tab_reason, tab_action, tab_performance = st.tabs(
+    [
+        "대시보드",
+        "What-if (사전)",
+        "사후 감사 (보조)",
+        "보고서",
+        "예측 실행",
+        "API 수집",
+        "위험 원인",
+        "대응 시나리오",
+        "모델 성능",
+    ]
 )
 
 with tab_dashboard:
@@ -509,15 +498,45 @@ with tab_dashboard:
         labels={"color": "위험점수"},
     )
     fig.update_layout(height=330, margin=dict(l=20, r=20, t=30, b=20))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     display_cols = ["채수위치", "lead_time", "예측일", "위험확률", "위험등급", "발령예측", "best_model"]
     st.dataframe(
         predictions[display_cols].sort_values(["채수위치", "lead_time"]),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={"위험확률": st.column_config.ProgressColumn("위험확률", min_value=0, max_value=1, format="%.3f")},
     )
+
+with tab_whatif:
+    _site_tab = (
+        st.selectbox("What-if 기준 지점", options=selected_sites, key="whatif_site_select")
+        if selected_sites
+        else "문의"
+    )
+    _b2 = load_model_bundles("환경·수문 기반 사전예측 모델")
+    render_whatif_tab(feature_df, target_date, _site_tab, _b2, load_final_dataframe())
+
+with tab_audit:
+    _site_tab = (
+        st.selectbox("사후 감사 기준 지점", options=selected_sites, key="audit_site_select")
+        if selected_sites
+        else "문의"
+    )
+    _b1 = load_model_bundles("조류 모니터링 포함 보조 모델")
+    _b2 = load_model_bundles("환경·수문 기반 사전예측 모델")
+    render_audit_tab(
+        feature_df,
+        target_date,
+        _site_tab,
+        _b1,
+        _b2,
+        load_final_dataframe(),
+        scenario_recommendation=scenario_recommendation,
+    )
+
+with tab_report:
+    render_report_tab()
 
 with tab_predict:
     st.subheader("예측 결과 다운로드")
@@ -549,7 +568,7 @@ with tab_predict:
         .groupby("채수위치", as_index=False)
         .tail(1)
     )
-    st.dataframe(recent[recent_cols], use_container_width=True, hide_index=True)
+    st.dataframe(recent[recent_cols], width="stretch", hide_index=True)
 
     if MODEL_CONFIGS[model_mode]["key"] == "monitoring":
         st.subheader("조류 모니터링 입력 확인")
@@ -570,7 +589,7 @@ with tab_predict:
         ]
         algae_cols = [c for c in algae_cols if c in feature_df.columns]
         st.caption("보조 모델은 아래 조류 모니터링 값과 lag/rolling 피처를 함께 사용합니다.")
-        st.dataframe(recent[algae_cols], use_container_width=True, hide_index=True)
+        st.dataframe(recent[algae_cols], width="stretch", hide_index=True)
 
     st.subheader("최근 30일 주요 변수 추세")
     trend_site = st.selectbox("추세 확인 지점", selected_sites)
@@ -583,7 +602,7 @@ with tab_predict:
     trend_long = trend.melt(id_vars="조사일", var_name="변수", value_name="값")
     fig = px.line(trend_long, x="조사일", y="값", color="변수", markers=True)
     fig.update_layout(height=420, margin=dict(l=20, r=20, t=30, b=20))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 with tab_api:
     st.subheader("API 기반 신규 관측값 준비")
@@ -598,7 +617,7 @@ with tab_api:
         "현재 사전예측 모델은 `total_cyano`와 유해남조류 4종 세포수를 사용하지 않습니다. "
         "`Chl-a`, `수온`, `pH`, `DO`, `탁도` 등 수질·환경 측정값은 실제 값으로 채운 뒤 누적 반영하세요."
     )
-    st.dataframe(template, use_container_width=True, hide_index=True)
+    st.dataframe(template, width="stretch", hide_index=True)
     template_csv = template.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     st.download_button(
         "당일 관측 템플릿 다운로드",
@@ -617,7 +636,7 @@ with tab_api:
             help="브라우저에 저장하지 않습니다. 필요하면 .streamlit/secrets.toml 또는 환경변수 방식으로 별도 관리하세요.",
         )
     with kma_col2:
-        kma_fetch = st.button("기상자료 불러오기", use_container_width=True)
+        kma_fetch = st.button("기상자료 불러오기", width="stretch")
 
     if kma_fetch:
         with st.spinner("기상청 ASOS 일자료를 수집하는 중입니다..."):
@@ -626,10 +645,10 @@ with tab_api:
             st.error(kma_result.message)
         else:
             st.success(kma_result.message)
-            st.dataframe(kma_result.data, use_container_width=True, hide_index=True)
+            st.dataframe(kma_result.data, width="stretch", hide_index=True)
             merged_template = merge_weather_into_observations(template, kma_result.data)
             st.markdown("##### 기상 API 값이 병합된 관측 템플릿")
-            st.dataframe(merged_template, use_container_width=True, hide_index=True)
+            st.dataframe(merged_template, width="stretch", hide_index=True)
             merged_csv = merged_template.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
             st.download_button(
                 "기상 병합 템플릿 다운로드",
@@ -672,7 +691,7 @@ with tab_api:
             ),
             height=140,
         )
-        if st.button("Generic API 호출", use_container_width=True):
+        if st.button("Generic API 호출", width="stretch"):
             try:
                 params = json.loads(params_text) if params_text.strip() else {}
             except json.JSONDecodeError as exc:
@@ -690,7 +709,7 @@ with tab_api:
                     st.error(generic_result.message)
                 else:
                     st.success(generic_result.message)
-                    st.dataframe(generic_result.data.head(100), use_container_width=True, hide_index=True)
+                    st.dataframe(generic_result.data.head(100), width="stretch", hide_index=True)
                     api_csv = generic_result.data.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
                     st.download_button(
                         "API 응답 CSV 다운로드",
@@ -715,11 +734,11 @@ with tab_reason:
         labels={"mean_abs_shap": "평균 |SHAP|", "feature": "변수"},
     )
     fig.update_layout(height=520, margin=dict(l=20, r=20, t=30, b=20))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     shap_img = fig_dir / f"shap_summary_Tplus{LEAD_DAYS[lead_for_reason]}.png"
     if shap_img.exists():
-        st.image(str(shap_img), caption=f"{lead_for_reason} SHAP summary plot", use_container_width=True)
+        st.image(str(shap_img), caption=f"{lead_for_reason} SHAP summary plot", width="stretch")
 
 with tab_action:
     st.subheader("리드타임별 권장 대응")
@@ -736,7 +755,7 @@ with tab_action:
                 "mean_abs_shap",
             ]
         ],
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -777,7 +796,7 @@ with tab_performance:
         c7.metric("Balanced Acc.", f"{row['balanced_accuracy']:.3f}")
         c8.metric("Threshold", f"{row['threshold']:.2f}")
 
-        st.dataframe(best_lead, use_container_width=True, hide_index=True)
+    st.dataframe(best_lead, width="stretch", hide_index=True)
 
     st.subheader(f"{perf_lead} 전체 모델 비교")
     test_results = model_results[
@@ -797,7 +816,7 @@ with tab_performance:
                 "threshold",
             ]
         ].sort_values("pr_auc", ascending=False),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -806,7 +825,7 @@ with tab_performance:
         st.subheader(f"{perf_lead} Confusion Matrix")
         cm_img = fig_dir / f"confusion_matrix_Tplus{LEAD_DAYS[perf_lead]}_best.png"
         if cm_img.exists():
-            st.image(str(cm_img), caption=f"{perf_lead} Confusion Matrix", use_container_width=True)
+            st.image(str(cm_img), caption=f"{perf_lead} Confusion Matrix", width="stretch")
         else:
             st.info("해당 리드타임의 Confusion Matrix 이미지가 없습니다.")
 
@@ -826,16 +845,16 @@ with tab_performance:
                 labels={"mean_abs_shap": "평균 |SHAP|", "feature": "변수"},
             )
             fig.update_layout(height=390, margin=dict(l=20, r=20, t=20, b=20))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
     st.subheader(f"{perf_lead} SHAP Summary")
     shap_img = fig_dir / f"shap_summary_Tplus{LEAD_DAYS[perf_lead]}.png"
     if shap_img.exists():
-        st.image(str(shap_img), caption=f"{perf_lead} SHAP summary plot", use_container_width=True)
+        st.image(str(shap_img), caption=f"{perf_lead} SHAP summary plot", width="stretch")
     else:
         st.info("해당 리드타임의 SHAP summary 이미지가 없습니다.")
 
     with st.expander("전체 리드타임 ROC/PR Curve 보기"):
         curve_img = fig_dir / "roc_pr_curve_best_models.png"
         if curve_img.exists():
-            st.image(str(curve_img), caption="ROC/PR Curve - Best Models", use_container_width=True)
+            st.image(str(curve_img), caption="ROC/PR Curve - Best Models", width="stretch")
