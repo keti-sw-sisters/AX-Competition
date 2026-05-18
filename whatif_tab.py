@@ -3,7 +3,7 @@
 
 app.py 예시::
 
-    from whatif_tab import render_audit_tab, render_report_tab, render_whatif_tab
+    from whatif_tab import render_audit_tab, render_whatif_tab
     ...
     with tab_whatif:
         render_whatif_tab(feature_df, target_date, site, bundles2, final_data)
@@ -11,7 +11,6 @@ app.py 예시::
 
 from __future__ import annotations
 
-import io
 from pathlib import Path
 from typing import Any
 
@@ -199,25 +198,6 @@ def _summarize_primary_causes(shap_top: list[dict[str, Any]]) -> str:
     return " + ".join(parts) + " 영향이 동시에 작용한 것으로 보입니다."
 
 
-def _resolve_history_col(feature_name: str, history: pd.DataFrame) -> str | None:
-    """전처리된 feature_name을 history 컬럼으로 최대한 매칭."""
-    if feature_name in history.columns:
-        return feature_name
-    # 흔한 변환 prefix 제거
-    candidates = [
-        feature_name.replace("num__", "").replace("cat__", ""),
-        feature_name.split("__")[-1],
-    ]
-    for c in candidates:
-        if c in history.columns:
-            return c
-    # 부분 문자열 매칭(너무 공격적이지 않게)
-    for col in history.columns:
-        if col in feature_name or feature_name in col:
-            return col
-    return None
-
-
 @st.cache_data(show_spinner=False)
 def _load_species_policy_insight() -> pd.DataFrame:
     """종별 회귀 모델 정책 인사이트 CSV 로드(T+7 기준)."""
@@ -237,10 +217,10 @@ def render_whatif_tab(
     bundles2: dict[str, dict],
     final_data: pd.DataFrame,
 ) -> None:
-    st.subheader("🔮 What-if 시뮬레이션 — 환경·수문 기반 사전예측 (모델 2)")
+    st.subheader("🔮 조건을 바꿔 보면 위험은?")
     st.caption(
-        "슬라이더로 환경·수문 조건을 바꾸면 T+1·T+3·T+7·T+10 리드타임별(모델2 각각) 발령 확률이 재계산됩니다. "
-        "파생변수(CHD, HRT, dry_days, BGI 등)는 `recalculate_derived`로 갱신됩니다."
+        "기온·강수·방류·저수율 등을 조정하면 T+1·T+3·T+7·T+10 발령 가능성이 바로 다시 계산됩니다. "
+        "연속고온일·체류시간 등 파생 지표도 함께 반영됩니다."
     )
 
     site_history = feature_df[feature_df["채수위치"] == site].sort_values("조사일").reset_index(drop=True)
@@ -257,14 +237,42 @@ def render_whatif_tab(
         history = before.iloc[:-1].copy()
 
     st.divider()
-    st.markdown("**⚡ 프리셋 시나리오 선택 (또는 아래 슬라이더 직접 조작)**")
-    n_presets = len(PRESET_SCENARIOS)
-    preset_cols = st.columns(min(n_presets, 5))
-    selected_preset: str | None = st.session_state.get("selected_preset")
-    for i, (pname, _pinfo) in enumerate(PRESET_SCENARIOS.items()):
-        col = preset_cols[i % len(preset_cols)]
-        if col.button(pname, width="stretch", key=f"preset_{pname}_{site}"):
-            st.session_state["selected_preset"] = pname
+    with st.container(border=True):
+        st.markdown("**⚡ 프리셋 시나리오 선택 (또는 아래 슬라이더 직접 조작)**")
+        st.markdown(
+            """
+            <style>
+            [data-testid="stVerticalBlockBorderWrapper"]:has([data-testid="preset-scenario-grid"]) button {
+                min-height: 3.6rem;
+                padding: 0.4rem 0.65rem;
+            }
+            [data-testid="stVerticalBlockBorderWrapper"]:has([data-testid="preset-scenario-grid"]) button p {
+                font-size: 0.8rem;
+                line-height: 1.3;
+                white-space: pre-line;
+                word-break: keep-all;
+                text-align: center;
+                overflow-wrap: normal;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown('<div data-testid="preset-scenario-grid" style="display:none"></div>', unsafe_allow_html=True)
+        selected_preset: str | None = st.session_state.get("selected_preset")
+        preset_items = list(PRESET_SCENARIOS.items())
+        cols_per_row = 2
+        for row_start in range(0, len(preset_items), cols_per_row):
+            row_cols = st.columns(cols_per_row)
+            for j, col in enumerate(row_cols):
+                idx = row_start + j
+                if idx >= len(preset_items):
+                    break
+                pname, pinfo = preset_items[idx]
+                btn_label = str(pinfo.get("label") or pname)
+                tip = f"{pname}\n{pinfo.get('desc', '')}"
+                if col.button(btn_label, width="stretch", key=f"preset_{pname}_{site}", help=tip):
+                    st.session_state["selected_preset"] = pname
 
     if selected_preset and selected_preset in PRESET_SCENARIOS:
         st.info(f"**{selected_preset}**: {PRESET_SCENARIOS[selected_preset]['desc']}")
@@ -518,9 +526,9 @@ def render_audit_tab(
     scenario_recommendation: pd.DataFrame | None = None,
 ) -> None:
     del final_data, bundles2
-    st.subheader("🔍 사후 감사 — 조류 모니터링 포함 보조 모델 (모델 1)")
+    st.subheader("🔍 조류 측정 후 위험 재확인")
     st.caption(
-        "조류 세포수 측정값을 반영해 모델 1로 재예측하고, 사후 설명·대응 판단에 활용합니다."
+        "오늘 채수한 남조류 세포수를 넣으면, 위험도·원인·권장 대응을 다시 확인할 수 있습니다."
     )
 
     site_history = feature_df[feature_df["채수위치"] == site].sort_values("조사일").reset_index(drop=True)
@@ -575,14 +583,14 @@ def render_audit_tab(
             hoenam_cyano_raw = float(auto_hoenam)
     with col2:
         st.info(
-            "**모델 1 사용 시점**\n\n"
-            "- 정기 채수 후 측정값 확보 즉시\n"
-            "- 고위험 경보 발령 전 최종 교차 검증\n"
-            "- 위험 상승 원인(상위 기여 요인) 설명 및 대응 체크"
+            "**이 화면은 언제 쓰나요?**\n\n"
+            "- 정기 채수·계수 직후 측정값이 나왔을 때\n"
+            "- 경보 발령 전 최종 점검이 필요할 때\n"
+            "- 위험이 왜 올랐는지, 무엇을 해야 하는지 정리할 때"
         )
 
-    if st.button("🔍 모델 1 사후 감사 실행", type="primary", width="stretch"):
-        with st.spinner("모델 1 예측 중..."):
+    if st.button("🔍 위험 재평가 실행", type="primary", width="stretch"):
+        with st.spinner("위험도를 다시 계산하는 중..."):
             audit_row = build_model1_audit_row(
                 base_row,
                 float(log_cyano_raw),
@@ -615,7 +623,7 @@ def render_audit_tab(
             "m1_probs": m1_probs,
             "audit_row": audit_row,
         }
-        st.success("사후 감사 완료. 결과를 확인하세요.")
+        st.success("재평가 완료. 아래 결과를 확인하세요.")
         st.rerun()
 
     disp = st.session_state.get("audit_last_display")
@@ -653,12 +661,12 @@ def render_audit_tab(
     # 모델 1 기반: 상위 기여 요인 + 근거(타임라인) + 대응 자동 매핑(체크리스트)
     # -------------------------------------------------------------------
     st.divider()
-    st.markdown("#### 🧠 왜 위험이 커졌나 (모델 1 설명)")
+    st.markdown("#### 🧠 왜 위험이 커졌나?")
 
     # 가장 위험한 리드타임(기본) + 선택
     max_lt = max(m1_probs, key=lambda k: float(m1_probs[k]))
     lead_for_shap = st.selectbox(
-        "설명 리드타임(모델 1)",
+        "설명할 리드타임",
         options=LEAD_TIMES,
         index=LEAD_TIMES.index(max_lt),
         key=f"audit_lead_for_shap_{site}",
@@ -680,29 +688,7 @@ def render_audit_tab(
             st.plotly_chart(shap_fig, width="stretch")
         st.info(f"요약: {_summarize_primary_causes(shap_top_m1)}")
     else:
-        st.info("모델 1 SHAP을 계산할 수 없어 설명을 생략합니다.")
-
-    # (B) 근거 타임라인: 최근 30개(또는 30일) 스냅샷
-    if not history.empty and shap_top_m1:
-        st.markdown("#### 📈 근거(최근 추세)")
-        h = history.sort_values("조사일").tail(30).copy()
-        h["조사일"] = pd.to_datetime(h["조사일"], errors="coerce")
-        for item in shap_top_m1[:5]:
-            feat = str(item.get("feature", ""))
-            col = _resolve_history_col(feat, h)
-            if not col:
-                continue
-            s = pd.to_numeric(h[col], errors="coerce")
-            if s.dropna().empty:
-                continue
-            cur_val = float(audit_row_disp.get(col, np.nan)) if col in audit_row_disp.index else float(s.iloc[-1])
-            p90 = float(np.nanpercentile(s.values, 90))
-            dfp = pd.DataFrame({"조사일": h["조사일"], col: s})
-            fig_ts = px.line(dfp, x="조사일", y=col, title=f"{col} (최근 {len(dfp)}개)")
-            fig_ts.add_hline(y=p90, line_dash="dot", line_color="orange", annotation_text="상위 10% 기준(p90)")
-            fig_ts.add_hline(y=cur_val, line_dash="dash", line_color="red", annotation_text="오늘/입력값")
-            fig_ts.update_layout(height=220, margin=dict(t=40, b=10))
-            st.plotly_chart(fig_ts, width="stretch")
+        st.info("위험 원인 설명을 계산할 수 없어 이 단계는 생략합니다.")
 
     st.markdown("#### ✅ 리드타임별 권장 대응")
     selected_actions: list[dict[str, Any]] = []
@@ -751,21 +737,34 @@ def render_audit_tab(
         cand_tokens = list(dict.fromkeys(cand_tokens))
 
         matched_df = action_df
+        shap_matched_n = 0
         if "shap_feature_group" in action_df.columns and cand_tokens:
             def _match_group(g: Any) -> bool:
                 gs = str(g).lower()
                 return any(tok.lower() in gs for tok in cand_tokens if len(tok) >= 2)
 
             matched_df = action_df[action_df["shap_feature_group"].apply(_match_group)].copy()
+            shap_matched_n = len(matched_df)
             if matched_df.empty:
                 matched_df = action_df.copy()
+                shap_matched_n = 0
 
         # 권장행 중복 제거(같은 액션 반복 방지)
         dedup_cols = [c for c in ["recommended_action", "responsible_unit", "urgency_level"] if c in matched_df.columns]
         if dedup_cols:
             matched_df = matched_df.drop_duplicates(subset=dedup_cols, keep="first")
 
-        # 종별 회귀 정책 인사이트(데이터 기반) 추가 매핑
+        # SHAP 변수명이 표와 안 맞아 매칭이 적을 때: 리드타임별 기본 권고(상위 SHAP) 보조
+        fallback_df = pd.DataFrame()
+        if shap_matched_n < 3 and cand_tokens and "mean_abs_shap" in action_df.columns:
+            fallback_df = (
+                action_df.nlargest(min(5, len(action_df)), "mean_abs_shap")
+                .drop_duplicates(subset=dedup_cols or None, keep="first")
+                if dedup_cols
+                else action_df.nlargest(min(5, len(action_df)), "mean_abs_shap")
+            )
+
+        # (선택) 종별 회귀 정책 — policy_insight_T7.csv 있을 때만 추가
         species_df = _load_species_policy_insight()
         species_actions = pd.DataFrame()
         if not species_df.empty and "주요 SHAP 변수" in species_df.columns:
@@ -790,25 +789,29 @@ def render_audit_tab(
                 species_actions = species_actions.drop_duplicates(
                     subset=["recommended_action", "shap_feature_group"], keep="first"
                 )
-        else:
-            st.warning(
-                "종별 회귀 정책 매핑 파일이 없어(또는 컬럼 불일치) 추가 매핑을 생략했습니다. "
-                "`outputs/species_regression/tables/policy_insight_T7.csv`를 생성해 주세요."
-            )
 
-        # 기존 대응표 + 종별 정책표 병합(중복 제거)
         merged_df = matched_df.copy()
+        if not fallback_df.empty:
+            merged_df = pd.concat([matched_df, fallback_df], ignore_index=True, sort=False)
         if not species_actions.empty:
-            merged_df = pd.concat([species_actions, matched_df], ignore_index=True, sort=False)
-            merged_df = merged_df.drop_duplicates(
-                subset=[c for c in ["recommended_action", "responsible_unit", "urgency_level"] if c in merged_df.columns],
-                keep="first",
-            )
+            merged_df = pd.concat([species_actions, merged_df], ignore_index=True, sort=False)
+        if dedup_cols and not merged_df.empty:
+            merged_df = merged_df.drop_duplicates(subset=dedup_cols, keep="first")
 
-        st.caption(
-            f"SHAP 상위 요인 기반 매핑: {len(matched_df)}개"
-            + (f" + 종별 회귀 정책매핑: {len(species_actions)}개" if not species_actions.empty else "")
-        )
+        cap_parts = [
+            f"위험 요인 ↔ 권장 대응표 매칭: {shap_matched_n}개",
+        ]
+        if not fallback_df.empty:
+            cap_parts.append(f"리드타임 기본 권고(상위 {len(fallback_df)}개) 보조")
+        if not species_actions.empty:
+            cap_parts.append(f"종별 정책 추가: {len(species_actions)}개")
+        st.caption(" · ".join(cap_parts))
+        if species_df.empty:
+            with st.expander("종별 회귀 정책 CSV (선택)", expanded=False):
+                st.caption(
+                    "없어도 동작합니다. 기본은 `outputs/modeling_env/tables/scenario_recommendation.csv` "
+                    "(또는 보조 모델은 `outputs/modeling/tables/`)만 사용합니다."
+                )
         if cols:
             st.dataframe(merged_df[cols], width="stretch", hide_index=True)
         else:
@@ -832,99 +835,3 @@ def render_audit_tab(
                 )
 
     report["권장대응"] = selected_actions
-
-def render_report_tab() -> None:
-    st.subheader("📄 사후 감사 보고서 출력")
-    st.caption("사후 감사 탭에서 실행한 결과가 여기에 누적됩니다.")
-
-    history: list[dict[str, Any]] = st.session_state.get(_SESSION_REPORT, [])
-    if not history:
-        st.info("아직 실행된 사후 감사 결과가 없습니다. '사후 감사' 탭에서 먼저 실행하세요.")
-        return
-
-    st.markdown(f"총 **{len(history)}건**의 감사 결과가 누적되어 있습니다.")
-
-    all_rows: list[dict[str, Any]] = []
-    for rpt in history:
-        for lt in LEAD_TIMES:
-            m1 = rpt.get("모델1_사후확인", {}).get(lt, {})
-            m2 = rpt.get("모델2_사전예측", {}).get(lt, {})
-            all_rows.append(
-                {
-                    "기준일": rpt.get("기준일", ""),
-                    "채수위치": rpt.get("채수위치", ""),
-                    "리드타임": lt,
-                    "모델1_확률": m1.get("확률", np.nan),
-                    "모델1_판정": m1.get("판정", ""),
-                    "종합판정": rpt.get("종합판정", ""),
-                    "권장대응_선택수": len(rpt.get("권장대응", []) or []),
-                }
-            )
-
-    full_df = pd.DataFrame(all_rows)
-
-    st.markdown("#### 최근 감사 결과")
-    latest = history[-1]
-    st.markdown(
-        f"**기준일:** {latest['기준일']}  |  **지점:** {latest['채수위치']}  |  **종합판정:** {latest['종합판정']}"
-    )
-    st.dataframe(export_report_df(latest), width="stretch", hide_index=True)
-
-    if latest.get("권장대응"):
-        st.markdown("#### ✅ 선택된 권장 대응")
-        st.dataframe(pd.DataFrame(latest["권장대응"]), width="stretch", hide_index=True)
-
-    if len(history) > 1:
-        st.markdown("#### 전체 감사 이력")
-        st.dataframe(full_df, width="stretch", hide_index=True)
-
-    st.markdown("#### 📥 다운로드")
-    col1, col2 = st.columns(2)
-    with col1:
-        csv_buf = io.StringIO()
-        full_df.to_csv(csv_buf, index=False, encoding="utf-8-sig")
-        st.download_button(
-            "📊 전체 보고서 CSV 다운로드",
-            data=csv_buf.getvalue().encode("utf-8-sig"),
-            file_name=f"algae_audit_report_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.csv",
-            mime="text/csv",
-            width="stretch",
-        )
-    with col2:
-        lines = ["=" * 60, "대청호 조류경보 사후 감사 보고서", "=" * 60, ""]
-        for rpt in history:
-            lines += [
-                f"기준일: {rpt['기준일']}  |  지점: {rpt['채수위치']}",
-                f"종합판정: {rpt['종합판정']}",
-                "",
-            ]
-            for lt in LEAD_TIMES:
-                m1 = rpt.get("모델1_사후확인", {}).get(lt, {})
-                m2 = rpt.get("모델2_사전예측", {}).get(lt, {})
-                if "모델2_사전예측" in rpt:
-                    match = rpt.get("일치여부", {}).get(lt, "")
-                    interp = rpt.get("해석", {}).get(lt, "")
-                    lines.append(
-                        f"  {lt}: 모델2={m2.get('확률', 0):.1%}({m2.get('판정', '')})"
-                        f" | 모델1={m1.get('확률', 0):.1%}({m1.get('판정', '')})"
-                        f" | {match} → {interp}"
-                    )
-                else:
-                    lines.append(
-                        f"  {lt}: 모델1={m1.get('확률', 0):.1%}({m1.get('판정', '')})"
-                        f" | threshold={m1.get('threshold', 0):.2f}"
-                    )
-            lines += ["", "-" * 60, ""]
-        txt = "\n".join(lines)
-        st.download_button(
-            "📝 텍스트 보고서 다운로드",
-            data=txt.encode("utf-8"),
-            file_name=f"algae_audit_report_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.txt",
-            mime="text/plain",
-            width="stretch",
-        )
-
-    if st.button("🗑️ 감사 이력 초기화", type="secondary"):
-        st.session_state[_SESSION_REPORT] = []
-        st.session_state.pop("audit_last_display", None)
-        st.rerun()

@@ -92,10 +92,145 @@ def main() -> None:
     plt.savefig(fig3_path, dpi=160, bbox_inches="tight")
     plt.close()
 
+    _try_generate_insight3_figures(tbl, out, lead_order)
+    _try_generate_accuracy_recall_tradeoff(tbl, out, lead_order)
+
     print("저장 완료:")
     print("-", fig1_path)
     print("-", fig2_path)
     print("-", fig3_path)
+
+
+def _try_generate_insight3_figures(tbl: Path, out: Path, lead_order: list[str]) -> None:
+    """
+    인사이트 3용: 라벨 이동(fig8), 테스트 채수위치별 F1(fig9).
+    `train_environmental_models.py`의 진단 CSV가 있을 때만 생성.
+    """
+    shift_path = tbl / "test_train_valid_test_label_shift.csv"
+    slice_path = tbl / "test_insight_slices.csv"
+    if not shift_path.exists() or not slice_path.exists():
+        print("(선택) fig8·fig9 스킵: test_train_valid_test_label_shift.csv 또는 test_insight_slices.csv 없음.")
+        return
+
+    sh = pd.read_csv(shift_path)
+    sh["lead_time"] = pd.Categorical(sh["lead_time"], categories=lead_order, ordered=True)
+    sh["split"] = pd.Categorical(sh["split"], categories=["train", "valid", "test"], ordered=True)
+
+    fig, ax = plt.subplots(figsize=(8.5, 4.2))
+    sns.barplot(data=sh, x="lead_time", y="positive_rate", hue="split", ax=ax, palette="muted")
+    ax.set_title("인사이트 3 — 구간별 양성비(라벨 이동): train → valid → test", fontsize=12, fontweight="bold")
+    ax.set_xlabel("리드타임")
+    ax.set_ylabel("양성 비율 (이진 발령)")
+    ax.set_ylim(0, max(0.45, sh["positive_rate"].max() * 1.12))
+    ax.legend(title="구간", loc="upper left")
+    plt.tight_layout()
+    fig8_path = out / "fig8_label_shift_train_valid_test.png"
+    plt.savefig(fig8_path, dpi=160, bbox_inches="tight")
+    plt.close()
+
+    sl = pd.read_csv(slice_path)
+    site = sl[sl["slice_dim"] == "site"].copy()
+    if site.empty or "f1" not in site.columns:
+        print("(선택) fig9 스킵: site 슬라이스 없음.")
+        print("-", fig8_path)
+        return
+    site["lead_time"] = pd.Categorical(site["lead_time"], categories=lead_order, ordered=True)
+    pivot = site.pivot_table(index="slice_value", columns="lead_time", values="f1", aggfunc="first")
+
+    plt.figure(figsize=(7.5, 3.8))
+    ax = sns.heatmap(pivot, annot=True, fmt=".3f", cmap="Blues", vmin=0, vmax=1, cbar_kws={"label": "F1 (테스트)"})
+    ax.set_title("인사이트 3 — 채수위치별 테스트 F1 (임계 적용)", fontsize=12, fontweight="bold")
+    ax.set_xlabel("리드타임")
+    ax.set_ylabel("채수위치")
+    plt.tight_layout()
+    fig9_path = out / "fig9_test_f1_by_site_and_lead.png"
+    plt.savefig(fig9_path, dpi=160, bbox_inches="tight")
+    plt.close()
+
+    print("-", fig8_path)
+    print("-", fig9_path)
+
+
+def _try_generate_accuracy_recall_tradeoff(tbl: Path, out: Path, lead_order: list[str]) -> None:
+    """
+    인사이트 9용: 불균형 데이터에서 Accuracy만으로는 미탐(저 Recall)을 가리기 어렵다는 근거.
+    `model_results.csv`의 env_with_chla 테스트 행만 사용.
+    """
+    mr_path = tbl / "model_results.csv"
+    if not mr_path.exists():
+        print("(선택) fig11 스킵: model_results.csv 없음.")
+        return
+
+    mr = pd.read_csv(mr_path)
+    sub = mr[(mr["experiment"] == "env_with_chla") & (mr["dataset"] == "test")].copy()
+    if sub.empty:
+        print("(선택) fig11 스킵: env_with_chla 테스트 행 없음.")
+        return
+
+    sub["lead_time"] = pd.Categorical(sub["lead_time"], categories=lead_order, ordered=True)
+    recall_cut = 0.75
+    y_min = max(0.78, float(sub["accuracy"].min()) - 0.04)
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 9), sharex=True, sharey=True)
+    axes_list = axes.ravel()
+
+    for idx, lead in enumerate(lead_order):
+        ax = axes_list[idx]
+        d = sub[sub["lead_time"] == lead].copy()
+        if d.empty:
+            ax.set_visible(False)
+            continue
+
+        pr = float(d["positive_rate"].iloc[0])
+        lazy_acc = 1.0 - pr  # 양성(발령)이 소수일 때, 항상 비발령 예측의 Accuracy
+
+        ax.axvspan(0.0, recall_cut, ymin=0, ymax=1, alpha=0.14, color="#e74c3c", zorder=0)
+        ax.axhline(lazy_acc, color="#555555", linestyle="--", linewidth=1.2, zorder=1)
+
+        sns.scatterplot(
+            data=d,
+            x="recall",
+            y="accuracy",
+            hue="model_name",
+            s=200,
+            ax=ax,
+            zorder=4,
+            legend=idx == 0,
+        )
+
+        ax.set_title(lead, fontsize=11, fontweight="bold")
+        ax.set_xlabel("Recall (재현율 · 미탐↓)")
+        ax.set_ylabel("Accuracy")
+        ax.set_xlim(-0.02, 1.02)
+        ax.set_ylim(y_min, 1.01)
+        ax.grid(True, alpha=0.35)
+
+        if idx != 0 and ax.get_legend() is not None:
+            ax.get_legend().remove()
+
+    if axes_list[0].get_legend() is not None:
+        axes_list[0].legend(title="모델", loc="lower right", fontsize=8)
+
+    fig.suptitle(
+        "테스트: Accuracy vs Recall (env_with_chla)\n"
+        "점선: ‘항상 비발령’만으로도 얻는 Accuracy — 고 Accuracy가 곧 안전하지 않음",
+        fontsize=12,
+        fontweight="bold",
+        y=1.02,
+    )
+    fig.text(
+        0.5,
+        0.01,
+        f"붉은 음영: Recall < {recall_cut:.2f} (미탐지 위험 구간 안내) · 본 분석은 PR-AUC·Recall 중심으로 모델을 비교함",
+        ha="center",
+        fontsize=9,
+    )
+
+    plt.tight_layout(rect=[0, 0.04, 1, 0.96])
+    fig11_path = out / "fig11_accuracy_vs_recall_imbalance.png"
+    plt.savefig(fig11_path, dpi=160, bbox_inches="tight")
+    plt.close()
+    print("-", fig11_path)
 
 
 if __name__ == "__main__":

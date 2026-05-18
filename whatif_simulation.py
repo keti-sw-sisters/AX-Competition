@@ -80,6 +80,7 @@ SLIDER_CONFIG: dict[str, dict[str, Any]] = {
 
 PRESET_SCENARIOS: dict[str, dict[str, Any]] = {
     "🌡️ 폭염 2주 지속": {
+        "label": "🌡️ 폭염\n2주",
         "desc": "평균기온 +3°C, 최고기온 +4°C, 일사량 증가, 강우 없음",
         "overrides": {
             "평균기온(°C)": lambda v: v + 3.0,
@@ -89,6 +90,7 @@ PRESET_SCENARIOS: dict[str, dict[str, Any]] = {
         },
     },
     "🌧️ 장마 후 고온 (D+14)": {
+        "label": "🌧️ 장마 후\nD+14 고온",
         "desc": "강우 이벤트(펄스) 이후 건조·고온 복합 — H2 가설(D+7~14 위험) 실데이터 검증",
         "overrides": {
             "강우량(mm)": lambda _: 0.0,
@@ -98,6 +100,7 @@ PRESET_SCENARIOS: dict[str, dict[str, Any]] = {
         "force_derived": {"dry_days": 14, "rain_pulse_flag": 1},
     },
     "🏜️ 가뭄 심화 + 저수율 하락": {
+        "label": "🏜️ 가뭄\n저수율↓",
         "desc": "저수율 하락, 방류 감소",
         "overrides": {
             "강우량(mm)": lambda _: 0.0,
@@ -107,10 +110,24 @@ PRESET_SCENARIOS: dict[str, dict[str, Any]] = {
         "force_derived": {"dry_days": 15},
     },
     "💧 방류량 +30% 증량": {
+        "label": "💧 방류\n+30%",
         "desc": "댐 방류량 30% 증가",
         "overrides": {"총방류량(㎥/s)": lambda v: v * 1.30},
     },
+    "☀️ 올해 같은 여름(고온·무강우·방류↑)": {
+        "label": "☀️ 여름형\n고온·무강우\n방류↑",
+        "desc": "여름형: 고온·무강우(0mm)·방류 25%↑ + 건조일 14일 — 사전점검용 시나리오",
+        "overrides": {
+            "평균기온(°C)": lambda v: v + 3.0,
+            "최고기온(°C)": lambda v: v + 4.0,
+            "강우량(mm)": lambda _: 0.0,
+            "합계 일사량(MJ/m2)": lambda v: min(v * 1.25, 28.0),
+            "총방류량(㎥/s)": lambda v: v * 1.25,
+        },
+        "force_derived": {"dry_days": 14},
+    },
     "⚠️ 복합 고위험": {
+        "label": "⚠️ 복합\n고위험",
         "desc": "고온 + 가뭄 + 저수율 하락",
         "overrides": {
             "평균기온(°C)": lambda v: v + 4.0,
@@ -894,6 +911,56 @@ def scenario_past_analysis(
     filter_desc = ""
     rain_window_rates: dict[str, float] = {}
     yearly_pattern: dict[int, dict[str, Any]] = {}
+
+    # ─── 올해 같은 여름: 6~9월 + 저강수 + (여름 내) 상대적 고방류 (+ 14일 기온 상위) ───
+    if "올해 같은 여름" in preset_name:
+        fd = fd_site.copy()
+        fd["월"] = fd["조사일"].dt.month
+        summ = fd[fd["월"].isin([6, 7, 8, 9])].copy()
+        rain_c = "강우량(mm)" if "강우량(mm)" in summ.columns else None
+        if rain_c is None and "일강수량(mm)" in summ.columns:
+            rain_c = "일강수량(mm)"
+        filter_desc = "6~9월"
+        if rain_c is not None and len(summ) > 20:
+            summ[rain_c] = pd.to_numeric(summ[rain_c], errors="coerce").fillna(0.0)
+            summ = summ[summ[rain_c] <= 3.0]
+            filter_desc += f", {rain_c}≤3mm"
+        if "총방류량(㎥/s)" in summ.columns and len(summ) > 5:
+            qd = float(summ["총방류량(㎥/s)"].astype(float).quantile(0.55))
+            summ = summ[summ["총방류량(㎥/s)"].astype(float) >= qd]
+            filter_desc += f", 방류≥여름내55%분위({qd:.0f}㎥/s)"
+        if "air_temp_mean_14d" in summ.columns and len(summ) > 5:
+            qt = float(summ["air_temp_mean_14d"].astype(float).quantile(0.50))
+            summ = summ[summ["air_temp_mean_14d"].astype(float) >= qt]
+            filter_desc += f", 14d평균기온≥여름내중앙({qt:.1f}°C)"
+        matched = summ
+        days_to_alert = _days_until_alert_after_rows(fd_site, matched) if len(matched) else []
+        avg_d = _avg_discharge_on_alert_rows(matched)
+        n = len(matched)
+        ar = float(matched["alert_binary"].mean()) if n else 0.0
+        years = sorted(matched["연도"].dropna().unique().astype(int).tolist()) if n else []
+        for yr, grp in matched.groupby("연도"):
+            yearly_pattern[int(yr)] = {"발생일수": len(grp), "발령비율": float(grp["alert_binary"].mean())}
+        mean_delay = float(np.mean(days_to_alert)) if days_to_alert else None
+        narrative = (
+            f"과거 '{filter_desc}' 조건 {n}일 중 발령 비율 {ar:.0%}"
+            + (f", 이후 첫 발령까지 평균 {mean_delay:.1f}일" if mean_delay is not None else "")
+            + (f", 발령 시 평균 방류 {avg_d:.0f} ㎥/s" if avg_d is not None else "")
+            + (f" (연도: {', '.join(map(str, years[:8]))}{'…' if len(years) > 8 else ''})" if years else "")
+            + ". 대시보드 What-if 프리셋과 동일 취지로 '올해 같은 여름' 사전점검에 활용."
+        )
+        return {
+            "title": preset_name,
+            "filter_desc": filter_desc,
+            "n_matched": n,
+            "alert_rate": ar,
+            "years": years,
+            "days_to_alert": days_to_alert,
+            "avg_discharge_at_alert": avg_d,
+            "yearly_pattern": yearly_pattern,
+            "rain_window_rates": rain_window_rates,
+            "narrative": narrative,
+        }
 
     # ─── 폭염: CHD + 건조 동시 ───────────────────────────────────────────
     if "폭염" in preset_name and "CHD" in fd_site.columns and "dry_days" in fd_site.columns:

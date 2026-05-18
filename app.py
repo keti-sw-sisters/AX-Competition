@@ -12,12 +12,17 @@ import plotly.express as px
 import streamlit as st
 
 from api_clients import (
+    DEFAULT_KMA_MID_REGID,
+    DEFAULT_KMA_SHORT_NX,
+    DEFAULT_KMA_SHORT_NY,
     fetch_generic_json_records,
     fetch_kma_asos_daily,
+    fetch_kma_mid_ta_forecast_daily,
+    fetch_kma_vilage_forecast_daily,
     merge_weather_into_observations,
 )
 from environmental_features import add_environmental_features
-from whatif_tab import render_audit_tab, render_report_tab, render_whatif_tab
+from whatif_tab import render_audit_tab, render_whatif_tab
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -290,7 +295,7 @@ def make_prediction_table(
     if history.empty:
         return pd.DataFrame()
 
-    latest = history.sort_values("조사일").groupby("채수위치", as_index=False).tail(1)
+    latest = latest_valid_observations(history, target_date, sites)
     for lead in LEAD_TIMES:
         bundle = bundles[lead]
         feature_cols = bundle["feature_cols"]
@@ -339,6 +344,60 @@ def format_prob(prob: float) -> str:
     return f"{prob * 100:.1f}%"
 
 
+# 수질·조류 등 “실측이 들어간” 행인지 판별 (강우만 0인 placeholder 제외)
+_OBSERVATION_SIGNAL_COLS = [
+    "total_cyano",
+    "microcystis",
+    "anabaena",
+    "oscillatoria",
+    "aphanizomenon",
+    "수온(℃)",
+    "Chl-a (㎎/㎥)",
+    "pH",
+    "DO(㎎/L)",
+    "탁도",
+    "투명도",
+]
+
+
+def _row_has_field_observation(row: pd.Series, value_cols: list[str]) -> bool:
+    for col in value_cols:
+        if col not in row.index:
+            continue
+        val = row[col]
+        if pd.notna(val):
+            return True
+    if "발령단계" in row.index:
+        stage = str(row["발령단계"]).strip() if pd.notna(row["발령단계"]) else ""
+        if stage and stage.lower() not in ("none", "nan", ""):
+            return True
+    return False
+
+
+def latest_valid_observations(
+    feature_df: pd.DataFrame,
+    target_date: pd.Timestamp,
+    sites: list[str],
+) -> pd.DataFrame:
+    """
+    지점별로 target_date 이하 데이터 중, 수질·조류 등이 채워진 마지막 행을 반환.
+    기준일 행이 API·템플릿만으로 비어 있으면 직전 유효 관측을 쓴다.
+    """
+    sub = feature_df[(feature_df["조사일"] <= target_date) & (feature_df["채수위치"].isin(sites))].copy()
+    if sub.empty:
+        return sub
+    sub = sub.sort_values(["채수위치", "조사일"])
+    value_cols = [c for c in _OBSERVATION_SIGNAL_COLS if c in sub.columns]
+    picked: list[pd.Series] = []
+    for _, grp in sub.groupby("채수위치", sort=False):
+        if value_cols:
+            valid = grp[grp.apply(lambda r: _row_has_field_observation(r, value_cols), axis=1)]
+            picked.append(valid.iloc[-1] if len(valid) else grp.iloc[-1])
+        else:
+            picked.append(grp.iloc[-1])
+    return pd.DataFrame(picked).reset_index(drop=True)
+
+
 def make_today_template(feature_df: pd.DataFrame, target_date: pd.Timestamp, sites: list[str]) -> pd.DataFrame:
     """Create rows for the selected operation date from the latest known site rows."""
     base = feature_df[(feature_df["조사일"] <= target_date) & (feature_df["채수위치"].isin(sites))].copy()
@@ -371,7 +430,7 @@ def make_today_template(feature_df: pd.DataFrame, target_date: pd.Timestamp, sit
 
 
 st.title("대청호 조류경보 조기대응 대시보드")
-st.caption("T+1, T+3, T+7, T+10 best model을 자동 실행하고 위험도, 원인, 대응 조치를 함께 보여줍니다.")
+st.caption("T+1·T+3·T+7·T+10 선행 예측과 위험도, 원인, 대응 조치를 한 화면에서 확인합니다.")
 
 with st.sidebar:
     st.header("실행 설정")
@@ -455,17 +514,16 @@ summary_by_lead = (
     .first()
 )
 
-tab_dashboard, tab_whatif, tab_audit, tab_report, tab_predict, tab_api, tab_reason, tab_action, tab_performance = st.tabs(
+tab_dashboard, tab_whatif, tab_audit, tab_predict, tab_api, tab_reason, tab_action, tab_performance = st.tabs(
     [
         "대시보드",
-        "What-if (사전)",
-        "사후 감사 (보조)",
-        "보고서",
-        "예측 실행",
+        "가정 시나리오",
+        "조류 측정 검증",
+        "예측·다운로드",
         "API 수집",
         "위험 원인",
         "대응 시나리오",
-        "모델 성능",
+        "예측 성능",
     ]
 )
 
@@ -510,7 +568,7 @@ with tab_dashboard:
 
 with tab_whatif:
     _site_tab = (
-        st.selectbox("What-if 기준 지점", options=selected_sites, key="whatif_site_select")
+        st.selectbox("시나리오 지점", options=selected_sites, key="whatif_site_select")
         if selected_sites
         else "문의"
     )
@@ -519,7 +577,7 @@ with tab_whatif:
 
 with tab_audit:
     _site_tab = (
-        st.selectbox("사후 감사 기준 지점", options=selected_sites, key="audit_site_select")
+        st.selectbox("검증 지점", options=selected_sites, key="audit_site_select")
         if selected_sites
         else "문의"
     )
@@ -534,9 +592,6 @@ with tab_audit:
         load_final_dataframe(),
         scenario_recommendation=scenario_recommendation,
     )
-
-with tab_report:
-    render_report_tab()
 
 with tab_predict:
     st.subheader("예측 결과 다운로드")
@@ -562,13 +617,20 @@ with tab_predict:
         "CHD",
     ]
     recent_cols = [c for c in recent_cols if c in feature_df.columns]
-    recent = (
-        feature_df[(feature_df["조사일"] <= target_date) & (feature_df["채수위치"].isin(selected_sites))]
-        .sort_values("조사일")
-        .groupby("채수위치", as_index=False)
-        .tail(1)
-    )
-    st.dataframe(recent[recent_cols], width="stretch", hide_index=True)
+    recent = latest_valid_observations(feature_df, target_date, selected_sites)
+    if recent.empty:
+        st.info("선택 지점·기준일에 해당하는 관측이 없습니다.")
+    else:
+        gap = (target_date.normalize() - pd.to_datetime(recent["조사일"]).dt.normalize()).dt.days
+        if (gap > 0).any():
+            st.caption(
+                "기준일 행에 수질·조류 값이 비어 있거나 없으면, **직전 유효 관측일**을 표시합니다. "
+                f"(기준일 {target_date.date()} 대비 최대 {int(gap.max())}일 이전)"
+            )
+        show = recent[recent_cols].copy()
+        if "발령단계" in show.columns:
+            show["발령단계"] = show["발령단계"].fillna("미발령")
+        st.dataframe(show, width="stretch", hide_index=True)
 
     if MODEL_CONFIGS[model_mode]["key"] == "monitoring":
         st.subheader("조류 모니터링 입력 확인")
@@ -626,19 +688,17 @@ with tab_api:
         mime="text/csv",
     )
 
-    st.markdown("#### 2. 기상청 ASOS 일자료 API")
-    kma_col1, kma_col2 = st.columns([2, 1])
-    with kma_col1:
-        kma_key = st.text_input(
-            "기상청 공공데이터포털 serviceKey",
-            value=get_secret("KMA_SERVICE_KEY", ""),
-            type="password",
-            help="브라우저에 저장하지 않습니다. 필요하면 .streamlit/secrets.toml 또는 환경변수 방식으로 별도 관리하세요.",
-        )
-    with kma_col2:
-        kma_fetch = st.button("기상자료 불러오기", width="stretch")
+    st.markdown("#### 2. 기상청 공공데이터 API")
+    kma_key = st.text_input(
+        "기상청 serviceKey (ASOS·단기·중기 공통)",
+        value=get_secret("KMA_SERVICE_KEY", ""),
+        type="password",
+        help="`.streamlit/secrets.toml`의 KMA_SERVICE_KEY 또는 환경변수 KMA_SERVICE_KEY",
+        key="kma_service_key_shared",
+    )
 
-    if kma_fetch:
+    st.markdown("##### 2-1. ASOS 일자료 (관측·병합용)")
+    if st.button("ASOS 일자료 불러오기", key="kma_asos_fetch", width="stretch"):
         with st.spinner("기상청 ASOS 일자료를 수집하는 중입니다..."):
             kma_result = fetch_kma_asos_daily(kma_key, target_date.date(), target_date.date())
         if not kma_result.ok:
@@ -647,7 +707,7 @@ with tab_api:
             st.success(kma_result.message)
             st.dataframe(kma_result.data, width="stretch", hide_index=True)
             merged_template = merge_weather_into_observations(template, kma_result.data)
-            st.markdown("##### 기상 API 값이 병합된 관측 템플릿")
+            st.markdown("**기상 병합 관측 템플릿**")
             st.dataframe(merged_template, width="stretch", hide_index=True)
             merged_csv = merged_template.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
             st.download_button(
@@ -655,7 +715,112 @@ with tab_api:
                 data=merged_csv,
                 file_name=f"observation_template_with_kma_{target_date.date()}.csv",
                 mime="text/csv",
+                key="dl_merged_kma_template",
             )
+
+    st.markdown("##### 2-2. 단기·중기 예보 (10일 위험 시나리오 입력용)")
+    st.caption(
+        "단기: 격자 `getVilageFcst` (기온 TMP·강수 PCP) · 중기: `getMidTa` (최저·최고 평균기온, 강수 없음). "
+        "대청댐 기본 격자·구역은 아래 기본값을 사용합니다."
+    )
+    fc1, fc2, fc3, fc4 = st.columns(4)
+    with fc1:
+        fc_nx = st.number_input("단기 nx", min_value=1, max_value=149, value=DEFAULT_KMA_SHORT_NX, step=1)
+    with fc2:
+        fc_ny = st.number_input("단기 ny", min_value=1, max_value=253, value=DEFAULT_KMA_SHORT_NY, step=1)
+    with fc3:
+        fc_reg = st.text_input("중기 regId", value=DEFAULT_KMA_MID_REGID)
+    with fc4:
+        st.write("")
+        fetch_short = st.button("단기예보 수집", key="kma_vilage_fetch", width="stretch")
+        fetch_mid = st.button("중기기온 수집", key="kma_mid_fetch", width="stretch")
+        fetch_both = st.button("단기+중기 모두", key="kma_fcst_both", width="stretch")
+
+    if fetch_short or fetch_both:
+        with st.spinner("기상청 단기예보를 수집하는 중입니다..."):
+            short_res = fetch_kma_vilage_forecast_daily(kma_key, nx=int(fc_nx), ny=int(fc_ny))
+        if not short_res.ok:
+            st.error(short_res.message)
+        else:
+            st.session_state["kma_short_fcst"] = short_res.data
+            st.success(short_res.message)
+
+    if fetch_mid or fetch_both:
+        with st.spinner("기상청 중기기온을 수집하는 중입니다..."):
+            mid_res = fetch_kma_mid_ta_forecast_daily(kma_key, reg_id=fc_reg.strip())
+        if not mid_res.ok:
+            st.error(mid_res.message)
+        else:
+            st.session_state["kma_mid_fcst"] = mid_res.data
+            st.success(mid_res.message)
+
+    short_df = st.session_state.get("kma_short_fcst")
+    mid_df = st.session_state.get("kma_mid_fcst")
+
+    if short_df is not None and len(short_df):
+        st.markdown("**단기예보 (일별)**")
+        show_short = short_df.copy()
+        show_short["예보일"] = pd.to_datetime(show_short["예보일"]).dt.strftime("%Y-%m-%d")
+        st.dataframe(show_short, width="stretch", hide_index=True)
+        fig_s = px.line(
+            short_df,
+            x="예보일",
+            y="기온(°C)",
+            markers=True,
+            title="단기예보 기온",
+        )
+        fig_s.update_layout(height=280, margin=dict(l=10, r=10, t=36, b=10))
+        st.plotly_chart(fig_s, width="stretch")
+        if "강수(mm)" in short_df.columns:
+            fig_r = px.bar(short_df, x="예보일", y="강수(mm)", title="단기예보 강수(일합)")
+            fig_r.update_layout(height=240, margin=dict(l=10, r=10, t=36, b=10))
+            st.plotly_chart(fig_r, width="stretch")
+        st.download_button(
+            "단기예보 CSV",
+            data=short_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+            file_name=f"kma_short_fcst_{target_date.date()}.csv",
+            mime="text/csv",
+            key="dl_kma_short",
+        )
+
+    if mid_df is not None and len(mid_df):
+        st.markdown("**중기기온 (일별)**")
+        show_mid = mid_df.copy()
+        show_mid["예보일"] = pd.to_datetime(show_mid["예보일"]).dt.strftime("%Y-%m-%d")
+        st.dataframe(show_mid, width="stretch", hide_index=True)
+        fig_m = px.line(
+            mid_df,
+            x="예보일",
+            y="기온(°C)",
+            markers=True,
+            title="중기기온 (최저·최고 평균)",
+        )
+        fig_m.update_layout(height=280, margin=dict(l=10, r=10, t=36, b=10))
+        st.plotly_chart(fig_m, width="stretch")
+        st.download_button(
+            "중기기온 CSV",
+            data=mid_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+            file_name=f"kma_mid_ta_{target_date.date()}.csv",
+            mime="text/csv",
+            key="dl_kma_mid",
+        )
+
+    if short_df is not None and mid_df is not None and len(short_df) and len(mid_df):
+        merged_fc = pd.concat(
+            [
+                short_df.assign(구분="단기"),
+                mid_df.assign(구분="중기"),
+            ],
+            ignore_index=True,
+            sort=False,
+        )
+        st.download_button(
+            "단기+중기 통합 CSV",
+            data=merged_fc.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+            file_name=f"kma_forecast_merged_{target_date.date()}.csv",
+            mime="text/csv",
+            key="dl_kma_merged",
+        )
 
     st.markdown("#### 3. 기관별 JSON API 테스트")
     st.caption(
@@ -766,7 +931,7 @@ with tab_action:
         st.warning(f"{action_lead} 기준 대응 필요 지점: {', '.join(high_rows['채수위치'].tolist())}")
 
 with tab_performance:
-    st.subheader("리드타임별 모델 성능")
+    st.subheader("리드타임별 예측 성능")
     perf_lead = st.selectbox("성능 확인 리드타임", LEAD_TIMES, key="lead_performance")
 
     metric_cols = [

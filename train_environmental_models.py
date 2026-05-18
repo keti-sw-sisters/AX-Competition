@@ -15,6 +15,7 @@ from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
     balanced_accuracy_score,
+    brier_score_loss,
     confusion_matrix,
     f1_score,
     precision_score,
@@ -51,6 +52,10 @@ for path in [TABLE_DIR, MODEL_DIR, FIG_DIR]:
 
 LEAD_TIMES = [1, 3, 7, 10]
 SITES = ["문의", "추동", "회남"]
+
+# 운영 정책: 동일 모델·확률에 대해 검증구간에서만 임계값을 계절별로 따로 잡을 때 사용
+OPS_SUMMER_MONTHS = (6, 7, 8, 9)
+OPS_WINTER_MONTHS = (12, 1, 2)
 
 # 경보 기준 또는 조류 농도와 직접 연결되는 누출 위험 변수.
 LEAKAGE_RAW_COLS = {
@@ -182,6 +187,13 @@ def evaluate_predictions(y_true: pd.Series, y_prob: np.ndarray, threshold: float
         "fn": int(fn),
         "tp": int(tp),
     }
+
+
+def _safe_tune_threshold(y_true: pd.Series, y_prob: np.ndarray, fallback: float) -> tuple[float, str]:
+    if len(y_true) < 25 or pd.Series(y_true).nunique() < 2:
+        return float(fallback), "fallback_global"
+    thr, _ = tune_threshold(y_true, y_prob)
+    return float(thr), "tuned"
 
 
 def tune_threshold(y_true: pd.Series, y_prob: np.ndarray) -> tuple[float, pd.DataFrame]:
@@ -356,6 +368,491 @@ def shap_analysis(best_models: dict[str, Pipeline], best_summary: pd.DataFrame, 
     return pd.DataFrame(rows)
 
 
+def summer_vs_full_on_jja_test(
+    df: pd.DataFrame,
+    model_results: pd.DataFrame,
+    *,
+    experiment_name: str = "env_with_chla",
+    summer_months: tuple[int, ...] = (6, 7, 8, 9),
+) -> pd.DataFrame:
+    """
+    전 기간 학습 vs 6~9월 행만 학습한 모델을, 동일하게 **테스트 기간 중 여름(6~9월) 행**에서 비교.
+    지표: PR-AUC(임계와 무관), Brier(확률 보정·낮을수록 좋음), 임계는 각 모델이 자체 검증구간에서 튜닝.
+    """
+    feature_cols, num_features, cat_features = build_feature_cols(
+        df, include_chla=(experiment_name == "env_with_chla")
+    )
+    rows: list[dict[str, object]] = []
+
+    for h in LEAD_TIMES:
+        lead = f"T+{h}"
+        target = f"y_Tplus{h}"
+        mr = model_results[
+            (model_results["experiment"] == experiment_name)
+            & (model_results["lead_time"] == lead)
+            & (model_results["dataset"] == "test")
+        ]
+        if mr.empty:
+            continue
+        best_name = str(mr.sort_values(["pr_auc", "f1", "recall"], ascending=False).iloc[0]["model_name"])
+
+        model_cols = list(dict.fromkeys(["조사일", "채수위치", target] + feature_cols))
+        data_h = df[model_cols].dropna(subset=[target]).copy()
+        data_h[target] = data_h[target].astype(int)
+        train_mask, valid_mask, test_mask = split_by_time(data_h)
+        train_df = data_h.loc[train_mask].copy()
+        valid_df = data_h.loc[valid_mask].copy()
+        test_df = data_h.loc[test_mask].copy()
+
+        train_df["_m"] = train_df["조사일"].dt.month
+        valid_df["_m"] = valid_df["조사일"].dt.month
+        test_df["_m"] = test_df["조사일"].dt.month
+
+        train_sum = train_df[train_df["_m"].isin(summer_months)]
+        valid_sum = valid_df[valid_df["_m"].isin(summer_months)]
+        test_sum = test_df[test_df["_m"].isin(summer_months)]
+
+        if len(test_sum) < 30 or test_sum[target].nunique() < 2:
+            rows.append(
+                {
+                    "lead_time": lead,
+                    "experiment": experiment_name,
+                    "best_model": best_name,
+                    "n_test_jja": len(test_sum),
+                    "pr_auc_full": np.nan,
+                    "pr_auc_summer": np.nan,
+                    "delta_pr_auc": np.nan,
+                    "brier_full": np.nan,
+                    "brier_summer": np.nan,
+                    "delta_brier": np.nan,
+                    "note": "테스트 여름 구간 부족 또는 단일 클래스",
+                }
+            )
+            continue
+
+        X_test_j, y_test_j = test_sum[feature_cols], test_sum[target]
+
+        pos = train_df[target].sum()
+        neg = len(train_df) - pos
+        spw = float(neg / pos) if pos > 0 else 1.0
+        specs = make_model_specs(spw)
+        if best_name not in specs:
+            best_name = "XGBoost"
+
+        def fit_eval(train_X, train_y, valid_X, valid_y) -> tuple[Pipeline, float, np.ndarray]:
+            pipe = Pipeline(
+                steps=[
+                    ("preprocess", make_preprocess(num_features, cat_features)),
+                    ("model", specs[best_name]),
+                ]
+            )
+            pipe.fit(train_X, train_y)
+            if len(valid_X) >= 30 and valid_y.nunique() >= 2:
+                vprob = pipe.predict_proba(valid_X)[:, 1]
+                thr, _ = tune_threshold(valid_y, vprob)
+            else:
+                vprob = pipe.predict_proba(train_X)[:, 1]
+                thr, _ = tune_threshold(train_y, vprob)
+            prob_j = pipe.predict_proba(X_test_j)[:, 1]
+            return pipe, thr, prob_j
+
+        X_tr, y_tr = train_df[feature_cols], train_df[target]
+        X_va, y_va = valid_df[feature_cols], valid_df[target]
+        _, thr_full, p_full = fit_eval(X_tr, y_tr, X_va, y_va)
+        pr_full = safe_auc(average_precision_score, y_test_j, p_full)
+        br_full = float(brier_score_loss(y_test_j, p_full))
+
+        X_trs, y_trs = train_sum[feature_cols], train_sum[target]
+        X_vas, y_vas = valid_sum[feature_cols], valid_sum[target]
+        if len(X_trs) < 80 or y_trs.sum() < 5 or y_trs.nunique() < 2:
+            rows.append(
+                {
+                    "lead_time": lead,
+                    "experiment": experiment_name,
+                    "best_model": best_name,
+                    "n_test_jja": len(test_sum),
+                    "pr_auc_full": pr_full,
+                    "pr_auc_summer": np.nan,
+                    "delta_pr_auc": np.nan,
+                    "brier_full": br_full,
+                    "brier_summer": np.nan,
+                    "delta_brier": np.nan,
+                    "n_train_summer": len(X_trs),
+                    "note": "여름만 학습 시 양성/표본 부족",
+                }
+            )
+            continue
+
+        if len(X_vas) < 20 or y_vas.nunique() < 2:
+            X_vas, y_vas = X_va, y_va
+
+        _, thr_sum, p_sum = fit_eval(X_trs, y_trs, X_vas, y_vas)
+        pr_sum = safe_auc(average_precision_score, y_test_j, p_sum)
+        br_sum = float(brier_score_loss(y_test_j, p_sum))
+
+        rows.append(
+            {
+                "lead_time": lead,
+                "experiment": experiment_name,
+                "best_model": best_name,
+                "n_test_jja": len(test_sum),
+                "test_jja_positive_rate": float(y_test_j.mean()),
+                "n_train_full": len(X_tr),
+                "n_train_summer": len(X_trs),
+                "pr_auc_full": pr_full,
+                "pr_auc_summer": pr_sum,
+                "delta_pr_auc": float(pr_sum - pr_full) if not (np.isnan(pr_full) or np.isnan(pr_sum)) else np.nan,
+                "brier_full": br_full,
+                "brier_summer": br_sum,
+                "delta_brier": float(br_sum - br_full),
+                "threshold_full": thr_full,
+                "threshold_summer": thr_sum,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def seasonal_operating_threshold_compare(
+    df: pd.DataFrame,
+    model_results: pd.DataFrame,
+    *,
+    experiment_name: str = "env_with_chla",
+    summer_months: tuple[int, ...] = OPS_SUMMER_MONTHS,
+    winter_months: tuple[int, ...] = OPS_WINTER_MONTHS,
+) -> pd.DataFrame:
+    """
+    모델은 전 기간 학습 1개만 사용. 검증(2023)에서
+    - 전 구간 공통 임계값
+    - 여름 월·겨울 월 부분집합 각각 임계값
+    을 튜닝한 뒤, 테스트(≥2024)에서는 조사일 월에 따라 여름/겨울/그 외(전역 임계)를 적용.
+    """
+    feature_cols, num_features, cat_features = build_feature_cols(
+        df, include_chla=(experiment_name == "env_with_chla")
+    )
+    out_rows: list[dict[str, object]] = []
+
+    for h in LEAD_TIMES:
+        lead = f"T+{h}"
+        target = f"y_Tplus{h}"
+        mr = model_results[
+            (model_results["experiment"] == experiment_name)
+            & (model_results["lead_time"] == lead)
+            & (model_results["dataset"] == "test")
+        ]
+        if mr.empty:
+            continue
+        best_name = str(mr.sort_values(["pr_auc", "f1", "recall"], ascending=False).iloc[0]["model_name"])
+
+        model_cols = list(dict.fromkeys(["조사일", "채수위치", target] + feature_cols))
+        data_h = df[model_cols].dropna(subset=[target]).copy()
+        data_h[target] = data_h[target].astype(int)
+        train_mask, valid_mask, test_mask = split_by_time(data_h)
+        train_df = data_h.loc[train_mask]
+        valid_df = data_h.loc[valid_mask]
+        test_df = data_h.loc[test_mask]
+
+        X_train, y_train = train_df[feature_cols], train_df[target]
+        X_valid, y_valid = valid_df[feature_cols], valid_df[target]
+        X_test, y_test = test_df[feature_cols], test_df[target]
+
+        pos = y_train.sum()
+        neg = len(y_train) - pos
+        spw = float(neg / pos) if pos > 0 else 1.0
+        specs = make_model_specs(spw)
+        if best_name not in specs:
+            best_name = "XGBoost"
+
+        pipe = Pipeline(
+            steps=[
+                ("preprocess", make_preprocess(num_features, cat_features)),
+                ("model", specs[best_name]),
+            ]
+        )
+        pipe.fit(X_train, y_train)
+        valid_prob = pipe.predict_proba(X_valid)[:, 1]
+        test_prob = pipe.predict_proba(X_test)[:, 1]
+
+        thr_global, _ = tune_threshold(y_valid, valid_prob)
+
+        vm = valid_df["조사일"].dt.month
+        m_s = vm.isin(summer_months)
+        m_w = vm.isin(winter_months)
+        thr_sum, tag_sum = _safe_tune_threshold(y_valid.loc[m_s], valid_prob[m_s.to_numpy()], thr_global)
+        thr_win, tag_win = _safe_tune_threshold(y_valid.loc[m_w], valid_prob[m_w.to_numpy()], thr_global)
+
+        m_test = test_df["조사일"].dt.month.to_numpy()
+        thr_vec = np.full(len(m_test), thr_global, dtype=float)
+        thr_vec[np.isin(m_test, summer_months)] = thr_sum
+        thr_vec[np.isin(m_test, winter_months)] = thr_win
+
+        y = y_test.to_numpy()
+        pred_g = (test_prob >= thr_global).astype(int)
+        pred_o = (test_prob >= thr_vec).astype(int)
+
+        def prf(mask: np.ndarray) -> tuple[float, float, float, int]:
+            if mask.sum() < 5:
+                return np.nan, np.nan, np.nan, int(mask.sum())
+            return (
+                float(precision_score(y[mask], pred_o[mask], zero_division=0)),
+                float(recall_score(y[mask], pred_o[mask], zero_division=0)),
+                float(f1_score(y[mask], pred_o[mask], zero_division=0)),
+                int(mask.sum()),
+            )
+
+        def prf_g(mask: np.ndarray) -> tuple[float, float, float, int]:
+            if mask.sum() < 5:
+                return np.nan, np.nan, np.nan, int(mask.sum())
+            return (
+                float(precision_score(y[mask], pred_g[mask], zero_division=0)),
+                float(recall_score(y[mask], pred_g[mask], zero_division=0)),
+                float(f1_score(y[mask], pred_g[mask], zero_division=0)),
+                int(mask.sum()),
+            )
+
+        mask_all = np.ones(len(y), dtype=bool)
+        mask_sum = np.isin(m_test, summer_months)
+        mask_win = np.isin(m_test, winter_months)
+        mask_oth = ~(mask_sum | mask_win)
+
+        for subset_name, mask in [
+            ("all", mask_all),
+            ("summer_test", mask_sum),
+            ("winter_test", mask_win),
+            ("spring_fall_test", mask_oth),
+        ]:
+            pg, rg, fg, ng = prf_g(mask)
+            po, ro, fo, no = prf(mask)
+            if ng == 0:
+                continue
+            out_rows.append(
+                {
+                    "lead_time": lead,
+                    "experiment": experiment_name,
+                    "model_name": best_name,
+                    "subset": subset_name,
+                    "n": ng,
+                    "thr_global": thr_global,
+                    "thr_summer_valid": thr_sum,
+                    "thr_winter_valid": thr_win,
+                    "summer_thr_source": tag_sum,
+                    "winter_thr_source": tag_win,
+                    "precision_global_thr": pg,
+                    "recall_global_thr": rg,
+                    "f1_global_thr": fg,
+                    "precision_seasonal_thr": po,
+                    "recall_seasonal_thr": ro,
+                    "f1_seasonal_thr": fo,
+                    "delta_recall": float(ro - rg) if not (np.isnan(ro) or np.isnan(rg)) else np.nan,
+                    "delta_precision": float(po - pg) if not (np.isnan(po) or np.isnan(pg)) else np.nan,
+                    "delta_f1": float(fo - fg) if not (np.isnan(fo) or np.isnan(fg)) else np.nan,
+                }
+            )
+
+    return pd.DataFrame(out_rows)
+
+
+def build_best_predictions_from_saved_env_models(
+    df: pd.DataFrame,
+    best_model_summary: pd.DataFrame,
+    *,
+    models_dir: Path = MODEL_DIR,
+) -> dict[str, dict] | None:
+    """
+    `main()`이 저장한 `best_model_Tplus{h}_{이름}_env.pkl`만으로 재학습 없이
+    `export_test_insight_diagnostics`에 넘길 수 있는 `best_predictions` dict를 만든다.
+
+    기대 경로 예: `outputs/modeling_env/models/best_model_Tplus1_XGBoost_env.pkl`
+    (`outputs/modeling/models/best_model_Tplus1_XGBoost.pkl` 등 **모델2용 파일과는 다름**.)
+    pkl이 하나라도 없으면 None.
+    """
+    out: dict[str, dict] = {}
+    for _, row in best_model_summary.iterrows():
+        lead = str(row["lead_time"])
+        h = int(lead.replace("T+", ""))
+        best_name = str(row["best_model"])
+        key = f"{lead}_{best_name}"
+        pkl = models_dir / f"best_model_Tplus{h}_{best_name}_env.pkl"
+        if not pkl.is_file():
+            return None
+        blob = joblib.load(pkl)
+        pipe = blob["pipeline"]
+        feature_cols: list[str] = list(blob["feature_cols"])
+        thr = float(blob["threshold"])
+        target = f"y_Tplus{h}"
+        model_cols = list(dict.fromkeys(["조사일", "채수위치", target] + feature_cols))
+        data_h = df[model_cols].dropna(subset=[target]).copy()
+        data_h[target] = data_h[target].astype(int)
+        _, _, test_mask = split_by_time(data_h)
+        test_df = data_h.loc[test_mask]
+        X_test, y_test = test_df[feature_cols], test_df[target]
+        tprob = pipe.predict_proba(X_test)[:, 1]
+        out[key] = {
+            "pipe": pipe,
+            "feature_cols": feature_cols,
+            "y_true": y_test.reset_index(drop=True),
+            "y_prob": pd.Series(np.asarray(tprob, dtype=float)),
+            "threshold": thr,
+        }
+    return out
+
+
+def export_test_insight_diagnostics(
+    df: pd.DataFrame,
+    best_predictions: dict[str, dict],
+    best_model_summary: pd.DataFrame,
+    *,
+    table_dir: Path = TABLE_DIR,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    테스트를 위치·월·연도로 잘라 PR-AUC·Brier·임계 적용 F1 등을 남긴다.
+    '무스킬' 대비: PR-AUC − 테스트 양성비(상수 예측 기준선에 가까운지 감 잡기용, 통계적 순서통계량은 아님).
+    """
+    slice_rows: list[dict[str, object]] = []
+    shift_rows: list[dict[str, object]] = []
+
+    for _, brow in best_model_summary.iterrows():
+        lead = str(brow["lead_time"])
+        h = int(lead.replace("T+", ""))
+        target = f"y_Tplus{h}"
+        best_name = str(brow["best_model"])
+        key = f"{lead}_{best_name}"
+        if key not in best_predictions:
+            continue
+        pred = best_predictions[key]
+        feature_cols: list[str] = list(pred["feature_cols"])
+        y_true = np.asarray(pred["y_true"], dtype=int)
+        y_prob = np.asarray(pred["y_prob"], dtype=float)
+        thr = float(pred["threshold"])
+
+        model_cols = list(dict.fromkeys(["조사일", "채수위치", target] + feature_cols))
+        data_h = df[model_cols].dropna(subset=[target]).copy()
+        data_h[target] = data_h[target].astype(int)
+        train_mask, valid_mask, test_mask = split_by_time(data_h)
+        test_df = data_h.loc[test_mask].reset_index(drop=True)
+        if len(test_df) != len(y_true):
+            continue
+
+        for split_name, mask in (
+            ("train", train_mask),
+            ("valid", valid_mask),
+            ("test", test_mask),
+        ):
+            part = data_h.loc[mask]
+            shift_rows.append(
+                {
+                    "lead_time": lead,
+                    "split": split_name,
+                    "n": len(part),
+                    "positive_rate": float(part[target].mean()) if len(part) else np.nan,
+                }
+            )
+
+        meta = pd.DataFrame(
+            {
+                "채수위치": test_df["채수위치"].astype(str).values,
+                "month": test_df["조사일"].dt.month.astype(int).values,
+                "year": test_df["조사일"].dt.year.astype(int).values,
+                "y_true": y_true,
+                "y_prob": y_prob,
+            }
+        )
+
+        def add_slice(slice_dim: str, slice_value: str, sub: pd.DataFrame) -> None:
+            if len(sub) < 15 or sub["y_true"].nunique() < 2:
+                return
+            yt = sub["y_true"].to_numpy()
+            yp = sub["y_prob"].to_numpy()
+            prev = float(np.mean(yt))
+            pr_auc = safe_auc(average_precision_score, pd.Series(yt), yp)
+            excess = float(pr_auc - prev) if not np.isnan(pr_auc) else np.nan
+            yhat_s = (yp >= thr).astype(int)
+            tnc, fpc, fnc, tpc = confusion_matrix(yt, yhat_s, labels=[0, 1]).ravel()
+            slice_rows.append(
+                {
+                    "lead_time": lead,
+                    "best_model": best_name,
+                    "slice_dim": slice_dim,
+                    "slice_value": slice_value,
+                    "n": len(sub),
+                    "prevalence": prev,
+                    "pr_auc": pr_auc,
+                    "pr_auc_minus_prevalence": excess,
+                    "brier": float(brier_score_loss(yt, yp)),
+                    "precision": float(precision_score(yt, yhat_s, zero_division=0)),
+                    "recall": float(recall_score(yt, yhat_s, zero_division=0)),
+                    "f1": float(f1_score(yt, yhat_s, zero_division=0)),
+                    "tn": int(tnc),
+                    "fp": int(fpc),
+                    "fn": int(fnc),
+                    "tp": int(tpc),
+                }
+            )
+
+        add_slice("all", "all", meta)
+        for site, sub in meta.groupby("채수위치", sort=True):
+            add_slice("site", str(site), sub)
+        for month, sub in meta.groupby("month", sort=True):
+            add_slice("month", str(int(month)), sub)
+        for year, sub in meta.groupby("year", sort=True):
+            add_slice("year", str(int(year)), sub)
+
+    slice_df = pd.DataFrame(slice_rows)
+    shift_df = pd.DataFrame(shift_rows)
+    slice_df.to_csv(table_dir / "test_insight_slices.csv", index=False, encoding="utf-8-sig")
+    shift_df.to_csv(table_dir / "test_train_valid_test_label_shift.csv", index=False, encoding="utf-8-sig")
+    if not slice_df.empty:
+        print(f"\n[인사이트 진단] 저장: {table_dir / 'test_insight_slices.csv'}, {table_dir / 'test_train_valid_test_label_shift.csv'} ({len(slice_df)}행)")
+    return slice_df, shift_df
+
+
+def _print_seasonal_operating_summary(comp: pd.DataFrame) -> None:
+    if comp.empty:
+        print("\n[계절별 임계 운영] 결과 없음.")
+        return
+    sub = comp[comp["subset"] == "all"].copy()
+    print("\n=== 운영: 동일 모델 + 여름·겨울 임계 분리 vs 전역 임계 (테스트 전체) ===")
+    if not sub.empty:
+        cols = [
+            "lead_time",
+            "thr_global",
+            "thr_summer_valid",
+            "thr_winter_valid",
+            "precision_global_thr",
+            "recall_global_thr",
+            "f1_global_thr",
+            "precision_seasonal_thr",
+            "recall_seasonal_thr",
+            "f1_seasonal_thr",
+        ]
+        print(sub[[c for c in cols if c in sub.columns]].round(4).to_string(index=False))
+    print("\n(부분집합: summer_test / winter_test / spring_fall_test 행은 CSV 참고.)")
+
+
+def _print_summer_vs_full_conclusion(comp: pd.DataFrame) -> None:
+    if comp.empty or "delta_pr_auc" not in comp.columns:
+        print("\n[여름 vs 전기간] 비교 결과 없음.")
+        return
+    sub = comp.dropna(subset=["delta_pr_auc"])
+    if sub.empty:
+        print("\n[여름 vs 전기간] PR-AUC 차이 산출 불가.")
+        return
+    m_pr = float(sub["delta_pr_auc"].mean())
+    m_br = float(sub["delta_brier"].mean()) if "delta_brier" in sub.columns else 0.0
+    # delta_brier = brier_summer - brier_full → 음수면 여름 전용이 보정(Brier)상 유리
+    if m_pr > 0.01 and m_br <= 0.0:
+        line = "한 줄 결론: 여름 테스트 구간에서 여름-only 학습이 PR-AUC와 Brier 모두 전기간 대비 유리해, 여름 전용이 나은 편이다(다른 시즌·연도 일반화는 별도 확인)."
+    elif m_pr > 0.01:
+        line = "한 줄 결론: 여름-only가 PR-AUC는 다소 우세하나 Brier(보정) 이득은 분명하지 않아, ‘여름 전용이 확실히 낫다’고 단정하긴 어렵다."
+    elif m_pr < -0.01:
+        line = "한 줄 결론: 전기간 모델이 여름 테스트에서도 PR-AUC가 더 좋아, 여름 전용으로 바꿀 이유는 없다."
+    else:
+        line = "한 줄 결론: PR-AUC·Brier 기준으로 전기간과 여름-only가 비슷해, 운영 단순화를 위해 전기간 단일 모델을 유지하는 편이 합리적이다."
+    print("\n=== 여름(6~9월) 테스트 구간: 전기간 학습 vs 여름-only 학습 ===")
+    print(comp.round(4).to_string(index=False))
+    print("\n" + line)
+
+
 def main() -> None:
     print("Preparing environmental dataset...")
     df = prepare_dataset()
@@ -527,6 +1024,8 @@ def main() -> None:
     best_model_summary.to_csv(TABLE_DIR / "best_model_summary.csv", index=False, encoding="utf-8-sig")
     save_curves({row["lead_time"]: best_predictions[f"{row['lead_time']}_{row['best_model']}"] for _, row in best_model_summary.iterrows()})
 
+    export_test_insight_diagnostics(df, best_predictions, best_model_summary)
+
     shap_top_features = shap_analysis(best_models, best_model_summary, df)
     shap_top_features.to_csv(TABLE_DIR / "shap_top_features.csv", index=False, encoding="utf-8-sig")
 
@@ -534,6 +1033,14 @@ def main() -> None:
         (model_results["experiment"] == "env_no_chla") & (model_results["dataset"] == "test")
     ].sort_values(["lead_time", "pr_auc"], ascending=[True, False])
     no_chla_summary.to_csv(TABLE_DIR / "sensitivity_no_chla_results.csv", index=False, encoding="utf-8-sig")
+
+    summer_comp = summer_vs_full_on_jja_test(df, model_results, experiment_name="env_with_chla")
+    summer_comp.to_csv(TABLE_DIR / "summer_vs_full_jja_test_metrics.csv", index=False, encoding="utf-8-sig")
+    _print_summer_vs_full_conclusion(summer_comp)
+
+    seasonal_ops = seasonal_operating_threshold_compare(df, model_results, experiment_name="env_with_chla")
+    seasonal_ops.to_csv(TABLE_DIR / "seasonal_operating_threshold_test.csv", index=False, encoding="utf-8-sig")
+    _print_seasonal_operating_summary(seasonal_ops)
 
     report_model_table = model_results[
         (model_results["experiment"] == "env_with_chla") & (model_results["dataset"] == "test")
